@@ -155,18 +155,7 @@ final class LogSpeedTracker {
     }
 
     private func latestLogDatabase() -> URL? {
-        let urls = (try? FileManager.default.contentsOfDirectory(
-            at: codexHome,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []
-        return urls
-            .filter { $0.lastPathComponent.hasPrefix("logs_") && $0.pathExtension == "sqlite" }
-            .max {
-                let left = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let right = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                return left < right
-            }
+        CodexDatabaseDiscovery.latest(prefix: "logs_", in: codexHome)
     }
 }
 

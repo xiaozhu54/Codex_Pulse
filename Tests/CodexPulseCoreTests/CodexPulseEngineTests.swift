@@ -23,6 +23,18 @@ struct CodexPulseBehaviorTests {
         print("PASS: Tool call keeps task active and shows waiting stage")
         try partialLineWaitsForCompletionAndContextCanRecover()
         print("PASS: Partial line waits and context can recover after compaction")
+        try globalWeeklyDoesNotDependOnSelectedSession()
+        print("PASS: Global weekly is independent from selected session")
+        try concurrentMainTasksFollowLatestTaskEvent()
+        print("PASS: Concurrent main tasks follow the latest task event")
+        try completeLineRequiresNewlineAndRotationResetsCursor()
+        print("PASS: Complete-line and rotation semantics are safe")
+        try presentationKeepsUnknownWeeklyNeutral()
+        print("PASS: Presentation keeps unknown weekly neutral")
+        try validPinnedSessionOverridesAutomaticFollowing()
+        print("PASS: Valid pin overrides automatic following")
+        try minimalSchemaAndBusyWALDegradeSafely()
+        print("PASS: Minimal schema and busy WAL degrade safely")
     }
 
     private static func idleShowsOnlyWeeklyRemaining() throws {
@@ -79,7 +91,7 @@ struct CodexPulseBehaviorTests {
         try expect(snapshot.sessionID == "main-thread", "expected main thread to win automatic following")
         try expect(snapshot.visibility == .active, "expected active visibility")
         try expect(
-            snapshot.menuBarText == "W 60% · 推理中… · GPT‑5.6 · Ctx 74%",
+            snapshot.menuBarText == "W 60% · — t/s · GPT‑5.6 · Ctx 74%",
             "expected complete active task summary"
         )
     }
@@ -233,9 +245,15 @@ struct CodexPulseBehaviorTests {
     }
 
     private static func weeklyColorsHonorAuthoredStops() throws {
-        try expect(WeeklyColor.color(remainingPercent: 100).hex == "#FFFFFF", "expected 100% to be white")
-        try expect(WeeklyColor.color(remainingPercent: 54.5).hex == "#FFCCA8", "expected authored middle stop")
-        try expect(WeeklyColor.color(remainingPercent: 0).hex == "#FF7417", "expected 0% to be orange")
+        let stops: [(Double, String)] = [
+            (100, "#FFFFFF"), (90.9, "#FFF9F2"), (81.8, "#FFF1E3"),
+            (72.7, "#FFE7D0"), (63.6, "#FFDABD"), (54.5, "#FFCCA8"),
+            (45.5, "#FFBD91"), (36.4, "#FFAD78"), (27.3, "#FF9D5F"),
+            (18.2, "#FF8D45"), (9.1, "#FF812E"), (0, "#FF7417")
+        ]
+        for (percent, hex) in stops {
+            try expect(WeeklyColor.color(remainingPercent: percent).hex == hex, "expected authored stop \(percent)%")
+        }
         try expect(
             WeeklyColor.color(remainingPercent: 50).hex != WeeklyColor.color(remainingPercent: 45.5).hex,
             "expected continuous interpolation between stops"
@@ -296,6 +314,111 @@ struct CodexPulseBehaviorTests {
             abs((after.contextAvailablePercent ?? -1) - 70) < 0.001,
             "expected context to recover after compaction"
         )
+    }
+
+    private static func globalWeeklyDoesNotDependOnSelectedSession() throws {
+        let fixture = try CodexHomeFixture()
+        try fixture.writeSession(id: "quota-source", title: "Older task", lines: [
+            #"{"timestamp":"2026-07-16T01:20:00Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+            #"{"timestamp":"2026-07-16T01:20:01Z","type":"event_msg","payload":{"type":"token_count","info":{},"rate_limits":{"limit_id":"codex","primary":{"used_percent":32,"window_minutes":10080}}}}"#,
+            #"{"timestamp":"2026-07-16T01:20:02Z","type":"event_msg","payload":{"type":"task_complete"}}"#
+        ])
+        try fixture.writeSession(id: "active", title: "Current task", lines: [
+            #"{"timestamp":"2026-07-16T01:21:00Z","type":"session_meta","payload":{"id":"active"}}"#,
+            #"{"timestamp":"2026-07-16T01:21:01Z","type":"event_msg","payload":{"type":"task_started"}}"#
+        ])
+        let snapshot = try CodexPulseEngine(codexHome: fixture.url).snapshot(
+            codexRunning: true, preferences: PulsePreferences()
+        )
+        try expect(snapshot.sessionID == "active", "expected current task to remain selected")
+        try expect(snapshot.weeklyRemainingPercent == 68, "expected newest Codex weekly record globally")
+    }
+
+    private static func concurrentMainTasksFollowLatestTaskEvent() throws {
+        let fixture = try CodexHomeFixture()
+        try fixture.writeSession(id: "older", title: "Older", lines: [
+            #"{"timestamp":"2026-07-16T01:29:59Z","type":"session_meta","payload":{"id":"older"}}"#,
+            #"{"timestamp":"2026-07-16T01:30:00Z","type":"event_msg","payload":{"type":"task_started"}}"#
+        ])
+        let newer = try fixture.writeSession(id: "newer", title: "Newer", lines: [
+            #"{"timestamp":"2026-07-16T01:30:59Z","type":"session_meta","payload":{"id":"newer"}}"#,
+            #"{"timestamp":"2026-07-16T01:31:00Z","type":"event_msg","payload":{"type":"task_started"}}"#
+        ])
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: newer.path)
+        let snapshot = try CodexPulseEngine(codexHome: fixture.url).snapshot(
+            codexRunning: true, preferences: PulsePreferences()
+        )
+        try expect(snapshot.sessionID == "newer", "expected event time, not file mtime, to select task")
+    }
+
+    private static func completeLineRequiresNewlineAndRotationResetsCursor() throws {
+        let fixture = try CodexHomeFixture()
+        try fixture.writeSession(id: "main-thread", title: "Cursor", lines: [
+            #"{"timestamp":"2026-07-16T01:40:00Z","type":"event_msg","payload":{"type":"task_started"}}"#
+        ])
+        let engine = CodexPulseEngine(codexHome: fixture.url)
+        _ = try engine.snapshot(codexRunning: true, preferences: PulsePreferences())
+        let quota = #"{"timestamp":"2026-07-16T01:40:01Z","type":"event_msg","payload":{"type":"token_count","info":{},"rate_limits":{"limit_id":"codex","primary":{"used_percent":10,"window_minutes":10080}}}}"#
+        try fixture.appendToSession(id: "main-thread", text: quota)
+        let incomplete = try engine.snapshot(codexRunning: true, preferences: PulsePreferences())
+        try expect(incomplete.weeklyRemainingPercent == nil, "expected newline-free JSON to remain buffered")
+        try fixture.appendToSession(id: "main-thread", text: "\n")
+        let complete = try engine.snapshot(codexRunning: true, preferences: PulsePreferences())
+        try expect(complete.weeklyRemainingPercent == 90, "expected newline to commit buffered JSON")
+
+        try fixture.replaceSession(id: "main-thread", lines: [
+            #"{"timestamp":"2026-07-16T01:41:00Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+            #"{"timestamp":"2026-07-16T01:41:01Z","type":"event_msg","payload":{"type":"token_count","info":{},"rate_limits":{"limit_id":"codex","primary":{"used_percent":80,"window_minutes":10080}}}}"#
+        ])
+        let rotated = try engine.snapshot(codexRunning: true, preferences: PulsePreferences())
+        try expect(rotated.weeklyRemainingPercent == 20, "expected replacement to reset cursor and state")
+    }
+
+    private static func presentationKeepsUnknownWeeklyNeutral() throws {
+        let snapshot = StatusSnapshot(visibility: .idle)
+        let text = MenuBarPresentation(snapshot: snapshot, preferences: PulsePreferences())
+        let icon = MenuBarPresentation(
+            snapshot: snapshot,
+            preferences: PulsePreferences(dynamicIconEnabled: true)
+        )
+        try expect(text.mode == .text && text.text == "W —", "expected idle text presentation")
+        try expect(text.weeklyColor == nil && icon.weeklyColor == nil, "expected unknown quota to have no orange color")
+        try expect(icon.mode == .icon, "expected dynamic icon presentation mode")
+    }
+
+    private static func validPinnedSessionOverridesAutomaticFollowing() throws {
+        let fixture = try CodexHomeFixture()
+        try fixture.writeSession(id: "pinned", title: "Pinned", lines: [
+            #"{"timestamp":"2026-07-16T01:50:00Z","type":"session_meta","payload":{"id":"pinned"}}"#,
+            #"{"timestamp":"2026-07-16T01:50:01Z","type":"event_msg","payload":{"type":"task_started"}}"#
+        ])
+        try fixture.writeSession(id: "newer", title: "Newer", lines: [
+            #"{"timestamp":"2026-07-16T01:51:00Z","type":"session_meta","payload":{"id":"newer"}}"#,
+            #"{"timestamp":"2026-07-16T01:51:01Z","type":"event_msg","payload":{"type":"task_started"}}"#
+        ])
+        let snapshot = try CodexPulseEngine(codexHome: fixture.url).snapshot(
+            codexRunning: true,
+            preferences: PulsePreferences(pinnedSessionID: "pinned")
+        )
+        try expect(snapshot.sessionID == "pinned", "expected pin to override newer task")
+        try expect(snapshot.selectionMode == .pinned, "expected pinned selection mode")
+    }
+
+    private static func minimalSchemaAndBusyWALDegradeSafely() throws {
+        let fixture = try CodexHomeFixture()
+        let path = try fixture.writeSession(id: "main-thread", title: "Schema", lines: [
+            #"{"timestamp":"2026-07-16T02:00:00Z","type":"session_meta","payload":{"id":"main-thread"}}"#,
+            #"{"timestamp":"2026-07-16T02:00:01Z","type":"event_msg","payload":{"type":"task_started"}}"#
+        ])
+        try fixture.writeMinimalThreadIndex(id: "main-thread", rolloutPath: path.path)
+        try fixture.withBusyWALThreadIndex {
+            let snapshot = try CodexPulseEngine(codexHome: fixture.url).snapshot(
+                codexRunning: true,
+                preferences: PulsePreferences()
+            )
+            try expect(snapshot.sessionID == "main-thread", "expected optional-column degradation to preserve session")
+            try expect(snapshot.visibility == .active, "expected busy WAL read to remain available")
+        }
     }
 
     private static func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
@@ -378,6 +501,42 @@ private final class CodexHomeFixture {
         }
     }
 
+    func writeMinimalThreadIndex(id: String, rolloutPath: String) throws {
+        let path = url.appendingPathComponent("state_9.sqlite").path
+        var database: OpaquePointer?
+        guard sqlite3_open(path, &database) == SQLITE_OK, let database else {
+            throw BehaviorTestFailure(message: "could not create minimal thread index")
+        }
+        defer { sqlite3_close(database) }
+        guard sqlite3_exec(database, "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)", nil, nil, nil) == SQLITE_OK else {
+            throw BehaviorTestFailure(message: "could not create minimal threads schema")
+        }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, "INSERT INTO threads VALUES (?, ?)", -1, &statement, nil) == SQLITE_OK,
+              let statement else { throw BehaviorTestFailure(message: "could not prepare minimal thread insert") }
+        defer { sqlite3_finalize(statement) }
+        bind(id, at: 1, to: statement)
+        bind(rolloutPath, at: 2, to: statement)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw BehaviorTestFailure(message: "could not insert minimal thread")
+        }
+    }
+
+    func withBusyWALThreadIndex(_ body: () throws -> Void) throws {
+        let path = url.appendingPathComponent("state_9.sqlite").path
+        var database: OpaquePointer?
+        guard sqlite3_open(path, &database) == SQLITE_OK, let database else {
+            throw BehaviorTestFailure(message: "could not open WAL fixture")
+        }
+        defer { sqlite3_close(database) }
+        guard sqlite3_exec(database, "PRAGMA journal_mode=WAL", nil, nil, nil) == SQLITE_OK,
+              sqlite3_exec(database, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else {
+            throw BehaviorTestFailure(message: "could not hold WAL write transaction")
+        }
+        defer { sqlite3_exec(database, "ROLLBACK", nil, nil, nil) }
+        try body()
+    }
+
     func writeLogs(rows: [LogRow]) throws {
         let path = url.appendingPathComponent("logs_9.sqlite").path
         var database: OpaquePointer?
@@ -427,6 +586,13 @@ private final class CodexHomeFixture {
         defer { try? handle.close() }
         try handle.seekToEnd()
         try handle.write(contentsOf: Data(text.utf8))
+    }
+
+    func replaceSession(id: String, lines: [String]) throws {
+        let file = url.appendingPathComponent("sessions/2026/07/16/rollout-\(id).jsonl")
+        let replacement = file.deletingLastPathComponent().appendingPathComponent("replacement-\(UUID().uuidString).jsonl")
+        try lines.joined(separator: "\n").appending("\n").write(to: replacement, atomically: true, encoding: .utf8)
+        _ = try FileManager.default.replaceItemAt(file, withItemAt: replacement)
     }
 
     private func bind(_ value: String?, at index: Int32, to statement: OpaquePointer) {

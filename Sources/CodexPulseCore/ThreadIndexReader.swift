@@ -10,33 +10,33 @@ struct ThreadMetadata {
     let isInternal: Bool
 }
 
-enum ThreadIndexReader {
-    static func load(from codexHome: URL) -> [String: ThreadMetadata] {
-        for databaseURL in stateDatabases(in: codexHome) {
-            guard let rows = try? read(databaseURL), !rows.isEmpty else { continue }
-            var index: [String: ThreadMetadata] = [:]
-            for row in rows {
-                index[row.id] = row
-                index[URL(fileURLWithPath: row.rolloutPath).standardizedFileURL.path] = row
-            }
-            return index
+final class ThreadIndexReader {
+    private let codexHome: URL
+    private var signature: String?
+    private var cached: [String: ThreadMetadata] = [:]
+
+    init(codexHome: URL) { self.codexHome = codexHome }
+
+    func load() -> [String: ThreadMetadata] {
+        guard let databaseURL = CodexDatabaseDiscovery.latest(prefix: "state_", in: codexHome) else { return [:] }
+        let current = databaseSignature(databaseURL)
+        if current == signature { return cached }
+        guard let rows = try? Self.read(databaseURL) else { return cached }
+        var index: [String: ThreadMetadata] = [:]
+        for row in rows {
+            index[row.id] = row
+            index[URL(fileURLWithPath: row.rolloutPath).standardizedFileURL.path] = row
         }
-        return [:]
+        signature = current
+        cached = index
+        return index
     }
 
-    private static func stateDatabases(in codexHome: URL) -> [URL] {
-        let urls = (try? FileManager.default.contentsOfDirectory(
-            at: codexHome,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        )) ?? []
-        return urls
-            .filter { $0.lastPathComponent.hasPrefix("state_") && $0.pathExtension == "sqlite" }
-            .sorted {
-                let left = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let right = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                return left > right
-            }
+    private func databaseSignature(_ url: URL) -> String {
+        [url, URL(fileURLWithPath: url.path + "-wal")].map { candidate in
+            let values = try? candidate.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+            return "\(values?.fileSize ?? -1):\(values?.contentModificationDate?.timeIntervalSince1970 ?? -1)"
+        }.joined(separator: "|")
     }
 
     private static func read(_ url: URL) throws -> [ThreadMetadata] {
@@ -50,6 +50,12 @@ enum ThreadIndexReader {
             columns.contains(name) ? "\"\(name)\"" : "\(fallback) AS \"\(name)\""
         }
 
+        let whereClause = columns.contains("archived") ? "WHERE archived = 0" : ""
+        let orderColumn: String
+        if columns.contains("updated_at_ms") { orderColumn = "updated_at_ms" }
+        else if columns.contains("updated_at") { orderColumn = "updated_at" }
+        else { orderColumn = "rowid" }
+        let hasPreview = columns.contains("preview")
         let sql = """
         SELECT
             \(expression("id")),
@@ -63,6 +69,9 @@ enum ThreadIndexReader {
             \(expression("thread_source")),
             \(expression("preview", fallback: "''"))
         FROM threads
+        \(whereClause)
+        ORDER BY \(orderColumn) DESC
+        LIMIT 64
         """
 
         return try database.query(sql) { statement in
@@ -87,7 +96,7 @@ enum ThreadIndexReader {
             let isAutoReview = model?.caseInsensitiveCompare("codex-auto-review") == .orderedSame
             let hasAgentPath = !(agentPath?.isEmpty ?? true)
             let isNonUserSource = threadSource.map { !$0.isEmpty && $0 != "user" } ?? false
-            let isInternal = isAutoReview || hasAgentPath || isNonUserSource || preview.isEmpty
+            let isInternal = isAutoReview || hasAgentPath || isNonUserSource || (hasPreview && preview.isEmpty)
 
             return ThreadMetadata(
                 id: id,

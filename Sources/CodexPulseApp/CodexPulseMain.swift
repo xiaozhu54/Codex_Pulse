@@ -21,7 +21,6 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusBar = StatusBarController()
     private var engine: CodexPulseEngine!
     private var refreshTimer: Timer?
-    private var wasCodexRunning = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         rebuildEngine()
@@ -57,11 +56,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             refreshTimer?.invalidate()
             refreshTimer = nil
             statusBar.hide()
-            if wasCodexRunning {
-                NSApp.terminate(nil)
-            }
+            NSApp.terminate(nil)
         }
-        wasCodexRunning = running
     }
 
     private func startRefreshTimer() {
@@ -83,7 +79,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             let sessions = (try? engine.availableSessions(
                 pinnedSessionID: currentPreferences.pinnedSessionID
             )) ?? []
-            statusBar.render(snapshot: snapshot, sessions: sessions, preferences: currentPreferences)
+            statusBar.render(
+                snapshot: snapshot,
+                sessions: sessions,
+                preferences: currentPreferences,
+                codexHomePath: preferences.codexHome.path
+            )
         } catch {
             let selection: SessionSelectionMode = currentPreferences.pinnedSessionID == nil
                 ? .automatic
@@ -96,7 +97,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 updatedAt: Date(),
                 dynamicIconEnabled: currentPreferences.dynamicIconEnabled
             )
-            statusBar.render(snapshot: snapshot, sessions: [], preferences: currentPreferences)
+            statusBar.render(
+                snapshot: snapshot,
+                sessions: [],
+                preferences: currentPreferences,
+                codexHomePath: preferences.codexHome.path
+            )
         }
     }
 

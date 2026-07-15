@@ -41,11 +41,7 @@ private final class MonitorDelegate: NSObject, NSApplicationDelegate {
     }
 
     private static func launchMainApplication() {
-        let mainApplicationURL = Bundle.main.bundleURL
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
+        let mainApplicationURL = containingApplication(for: Bundle.main.bundleURL)
         guard mainApplicationURL.pathExtension == "app" else { return }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = false
@@ -54,5 +50,11 @@ private final class MonitorDelegate: NSObject, NSApplicationDelegate {
             at: mainApplicationURL,
             configuration: configuration
         ) { _, _ in }
+    }
+
+    private static func containingApplication(for helperBundleURL: URL) -> URL {
+        var url = helperBundleURL
+        for _ in 0..<4 { url.deleteLastPathComponent() }
+        return url
     }
 }

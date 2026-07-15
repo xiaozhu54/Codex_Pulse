@@ -6,6 +6,7 @@ struct PulseDetailView: View {
     let snapshot: StatusSnapshot
     let sessions: [SessionSummary]
     let preferences: PulsePreferences
+    let codexHomePath: String
     let onDynamicIconChanged: @MainActor @Sendable (Bool) -> Void
     let onLaunchWithCodexChanged: @MainActor @Sendable (Bool) -> Void
     let onPinSession: @MainActor @Sendable (String?) -> Void
@@ -18,10 +19,8 @@ struct PulseDetailView: View {
             header
             Divider()
             metrics
-            if snapshot.visibility == .active || snapshot.selectionMode != .automatic {
-                Divider()
-                sessionSection
-            }
+            Divider()
+            sessionSection
             Divider()
             settings
         }
@@ -115,6 +114,11 @@ struct PulseDetailView: View {
                 Spacer()
                 Button("退出插件", action: onQuit)
             }
+            Text("CODEX_HOME: \(codexHomePath)")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
         .toggleStyle(.switch)
     }
@@ -128,7 +132,8 @@ struct PulseDetailView: View {
     }
 
     private var weeklySwiftUIColor: Color {
-        let rgb = WeeklyColor.color(remainingPercent: snapshot.weeklyRemainingPercent ?? 0)
+        guard let percent = snapshot.weeklyRemainingPercent else { return .secondary }
+        let rgb = WeeklyColor.color(remainingPercent: percent)
         return Color(red: rgb.red, green: rgb.green, blue: rgb.blue)
     }
 

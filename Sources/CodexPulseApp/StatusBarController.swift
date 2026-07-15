@@ -26,11 +26,13 @@ final class StatusBarController: NSObject {
     private var snapshot = StatusSnapshot.hidden
     private var sessions: [SessionSummary] = []
     private var preferences = PulsePreferences()
+    private var codexHomePath = "~/.codex"
 
     override init() {
         super.init()
-        popover.behavior = .applicationDefined
+        popover.behavior = .transient
         popover.animates = true
+        popover.delegate = self
     }
 
     func show() {
@@ -61,10 +63,11 @@ final class StatusBarController: NSObject {
         isPopoverPinned = false
     }
 
-    func render(snapshot: StatusSnapshot, sessions: [SessionSummary], preferences: PulsePreferences) {
+    func render(snapshot: StatusSnapshot, sessions: [SessionSummary], preferences: PulsePreferences, codexHomePath: String) {
         self.snapshot = snapshot
         self.sessions = sessions
         self.preferences = preferences
+        self.codexHomePath = codexHomePath
         guard snapshot.visibility != .hidden else {
             hide()
             return
@@ -135,6 +138,7 @@ final class StatusBarController: NSObject {
             snapshot: snapshot,
             sessions: sessions,
             preferences: preferences,
+            codexHomePath: codexHomePath,
             onDynamicIconChanged: actions.toggleDynamicIcon,
             onLaunchWithCodexChanged: actions.toggleLaunchWithCodex,
             onPinSession: actions.pinSession,
@@ -223,8 +227,10 @@ final class StatusBarController: NSObject {
         let nsText = text as NSString
         let separator = nsText.range(of: " · ")
         weeklyLength = separator.location == NSNotFound ? nsText.length : separator.location
-        let rgb = WeeklyColor.color(remainingPercent: snapshot.weeklyRemainingPercent ?? 0)
-        let color = NSColor(srgbRed: rgb.red, green: rgb.green, blue: rgb.blue, alpha: 1)
+        let color = snapshot.weeklyRemainingPercent.map { percent -> NSColor in
+            let rgb = WeeklyColor.color(remainingPercent: percent)
+            return NSColor(srgbRed: rgb.red, green: rgb.green, blue: rgb.blue, alpha: 1)
+        } ?? .secondaryLabelColor
         let shadow = NSShadow()
         shadow.shadowColor = NSColor.black.withAlphaComponent(0.45)
         shadow.shadowBlurRadius = 1
@@ -237,9 +243,10 @@ final class StatusBarController: NSObject {
     }
 
     private func coloredIcon() -> NSImage {
-        let percent = snapshot.weeklyRemainingPercent ?? 0
-        let rgb = WeeklyColor.color(remainingPercent: percent)
-        let color = NSColor(srgbRed: rgb.red, green: rgb.green, blue: rgb.blue, alpha: 1)
+        let color = snapshot.weeklyRemainingPercent.map { percent -> NSColor in
+            let rgb = WeeklyColor.color(remainingPercent: percent)
+            return NSColor(srgbRed: rgb.red, green: rgb.green, blue: rgb.blue, alpha: 1)
+        } ?? .secondaryLabelColor
         let source = sourceIcon()
         let size = NSSize(width: 18, height: 18)
         let outline = mask(source: source, color: NSColor.black.withAlphaComponent(0.5), size: size)
@@ -285,6 +292,13 @@ final class StatusBarController: NSObject {
         )
         image.unlockFocus()
         return image
+    }
+}
+
+extension StatusBarController: NSPopoverDelegate {
+    func popoverDidClose(_ notification: Notification) {
+        isPopoverPinned = false
+        isPopoverHovered = false
     }
 }
 
