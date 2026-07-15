@@ -1,7 +1,7 @@
 .PHONY: test build
 
 test:
-	./Scripts/run-tests.sh
+	bash Scripts/run-tests.sh
 
 build: test
-	./Scripts/build-app.sh
+	bash Scripts/build-app.sh
