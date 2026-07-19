@@ -14,41 +14,64 @@ struct StatusBarActions {
 
 @MainActor
 final class StatusBarController: NSObject {
-    var actions = StatusBarActions()
+    static let autosaveName = "com.origami.codexpulse.status-item"
+
+    var actions = StatusBarActions() {
+        didSet { detailModel.actions = actions }
+    }
 
     private var statusItem: NSStatusItem?
     private let popover = NSPopover()
-    private var hoverTracker: HoverTrackingView?
+    private var hoverTracker: HoverTrackingOwner?
     private var hoverOpenWorkItem: DispatchWorkItem?
     private var hoverCloseWorkItem: DispatchWorkItem?
     private var isPopoverPinned = false
     private var isPopoverHovered = false
-    private var snapshot = StatusSnapshot.hidden
-    private var sessions: [SessionSummary] = []
-    private var preferences = PulsePreferences()
-    private var codexHomePath = "~/.codex"
+    private var presentation = PulseViewState.hidden
+    private let detailModel = PulseDetailViewModel()
+    private var renderedDynamicIconEnabled: Bool?
+    private var renderedMenuBarText: String?
+    private var renderedWeeklyPercent: Double?
+    private var didGuideForBlockedStatusItem = false
 
     override init() {
         super.init()
         popover.behavior = .transient
-        popover.animates = true
+        popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         popover.delegate = self
+        detailModel.onHoverChanged = { [weak self] hovering in
+            self?.isPopoverHovered = hovering
+            if hovering { self?.hoverCloseWorkItem?.cancel() }
+            else { self?.scheduleHoverClose() }
+        }
+        popover.contentViewController = NSHostingController(rootView: PulseDetailView(model: detailModel))
     }
 
     func show() {
-        guard statusItem == nil else { return }
+        if let statusItem {
+            // A status item can become invisible after an interrupted Command-drag.
+            // It is not user-removable, so restore it instead of leaving the app
+            // running without any way to reach its controls.
+            if !statusItem.isVisible { statusItem.isVisible = true }
+            return
+        }
+        StatusItemPlacementPreflight.repairIfNeeded(autosaveName: Self.autosaveName)
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.autosaveName = Self.autosaveName
+        item.behavior = []
+        item.isVisible = true
         guard let button = item.button else { return }
+        button.title = "W —"
+        button.imagePosition = .noImage
         button.target = self
         button.action = #selector(statusButtonPressed(_:))
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         button.toolTip = "Codex Pulse"
 
-        let tracker = HoverTrackingView(frame: button.bounds)
-        tracker.autoresizingMask = [.width, .height]
+        let tracker = HoverTrackingOwner()
         tracker.onEntered = { [weak self] in self?.scheduleHoverOpen() }
         tracker.onExited = { [weak self] in self?.scheduleHoverClose() }
-        button.addSubview(tracker)
+        tracker.install(on: button)
         hoverTracker = tracker
         statusItem = item
     }
@@ -57,38 +80,115 @@ final class StatusBarController: NSObject {
         hoverOpenWorkItem?.cancel()
         hoverCloseWorkItem?.cancel()
         popover.performClose(nil)
+        hoverTracker?.uninstall()
         if let statusItem { NSStatusBar.system.removeStatusItem(statusItem) }
         statusItem = nil
         hoverTracker = nil
         isPopoverPinned = false
+        renderedDynamicIconEnabled = nil
+        renderedMenuBarText = nil
+        renderedWeeklyPercent = nil
     }
 
-    func render(snapshot: StatusSnapshot, sessions: [SessionSummary], preferences: PulsePreferences, codexHomePath: String) {
-        self.snapshot = snapshot
-        self.sessions = sessions
-        self.preferences = preferences
-        self.codexHomePath = codexHomePath
-        guard snapshot.visibility != .hidden else {
+    func health() -> StatusItemHealth {
+        guard let statusItem else {
+            return StatusItemHealth(
+                isVisible: false,
+                hasButton: false,
+                hasWindow: false,
+                hasScreen: false,
+                width: 0
+            )
+        }
+        let button = statusItem.button
+        return StatusItemHealth(
+            isVisible: statusItem.isVisible,
+            hasButton: button != nil,
+            hasWindow: button?.window != nil,
+            hasScreen: button?.window?.screen != nil,
+            width: Double(button?.bounds.width ?? 0)
+        )
+    }
+
+    func recover(_ action: StatusItemRecoveryAction) {
+        switch action {
+        case .none:
+            didGuideForBlockedStatusItem = false
+        case .refresh:
+            statusItem?.isVisible = true
+            statusItem?.button?.needsDisplay = true
+        case .rebuild:
+            guard presentation.mode != .hidden else { return }
+            hide()
+            show()
+            applyPresentation()
+        case .guideUser:
+            guard !didGuideForBlockedStatusItem else { return }
+            didGuideForBlockedStatusItem = true
+            let alert = NSAlert()
+            alert.messageText = "Codex Pulse 菜单栏图标被系统隐藏"
+            alert.informativeText = "请在系统设置的菜单栏管理中允许 Codex Pulse 显示。应用会继续在本地运行。"
+            alert.addButton(withTitle: "打开菜单栏设置")
+            alert.addButton(withTitle: "稍后")
+            if alert.runModal() == .alertFirstButtonReturn,
+               let url = URL(string: "x-apple.systempreferences:com.apple.ControlCenter-Settings.extension") {
+                NSWorkspace.shared.open(url)
+            }
+        }
+    }
+
+    func render(_ presentation: PulseViewState) {
+        self.presentation = presentation
+        detailModel.presentation = presentation
+        detailModel.actions = actions
+        guard presentation.mode != .hidden else {
             hide()
             return
         }
         show()
+        applyPresentation()
+    }
+
+    private func applyPresentation() {
         guard let item = statusItem, let button = item.button else { return }
 
-        if preferences.dynamicIconEnabled {
-            item.length = NSStatusItem.squareLength
-            button.attributedTitle = NSAttributedString(string: "")
-            button.image = coloredIcon()
-            button.imagePosition = .imageOnly
-            button.setAccessibilityLabel("Codex Pulse，Weekly \(weeklyAccessibilityValue)")
-        } else {
-            item.length = NSStatusItem.variableLength
-            button.image = nil
-            button.attributedTitle = attributedMenuTitle(snapshot.menuBarText)
-            button.imagePosition = .noImage
-            button.setAccessibilityLabel("Codex Pulse，\(snapshot.menuBarText)")
+        // AppKit owns the status item while Command-dragging it. Changing its
+        // length or contents during that gesture can cancel the move and leave
+        // the item hidden. The next 500 ms refresh applies the latest snapshot.
+        guard !NSEvent.modifierFlags.contains(.command) else {
+            if popover.isShown { updatePopoverContent() }
+            return
         }
-        updatePopoverContent()
+
+        if presentation.mode == .icon {
+            if renderedDynamicIconEnabled != true ||
+                renderedWeeklyPercent != presentation.weeklyPercent {
+                item.length = NSStatusItem.squareLength
+                button.attributedTitle = NSAttributedString(string: "")
+                button.image = coloredIcon()
+                button.alternateImage = highContrastIcon()
+                button.imagePosition = .imageOnly
+            }
+            button.setAccessibilityLabel(presentation.accessibilityLabel)
+        } else {
+            if renderedDynamicIconEnabled != false ||
+                renderedMenuBarText != presentation.menuBarText ||
+                renderedWeeklyPercent != presentation.weeklyPercent {
+                item.length = NSStatusItem.variableLength
+                button.image = nil
+                button.alternateImage = nil
+                button.attributedTitle = attributedMenuTitle(presentation.menuBarSegments)
+                button.attributedAlternateTitle = attributedMenuTitle(
+                    presentation.menuBarSegments,
+                    selected: true
+                )
+                button.imagePosition = .noImage
+            }
+            button.setAccessibilityLabel(presentation.accessibilityLabel)
+        }
+        renderedDynamicIconEnabled = presentation.mode == .icon
+        renderedMenuBarText = presentation.menuBarText
+        renderedWeeklyPercent = presentation.weeklyPercent
     }
 
     @objc private func statusButtonPressed(_ sender: Any?) {
@@ -127,6 +227,7 @@ final class StatusBarController: NSObject {
 
     private func showPopover() {
         guard let button = statusItem?.button else { return }
+        popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         updatePopoverContent()
         if !popover.isShown {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
@@ -134,22 +235,8 @@ final class StatusBarController: NSObject {
     }
 
     private func updatePopoverContent() {
-        popover.contentViewController = NSHostingController(rootView: PulseDetailView(
-            snapshot: snapshot,
-            sessions: sessions,
-            preferences: preferences,
-            codexHomePath: codexHomePath,
-            onDynamicIconChanged: actions.toggleDynamicIcon,
-            onLaunchWithCodexChanged: actions.toggleLaunchWithCodex,
-            onPinSession: actions.pinSession,
-            onChooseCodexHome: actions.chooseCodexHome,
-            onQuit: actions.quit,
-            onHoverChanged: { [weak self] hovering in
-                self?.isPopoverHovered = hovering
-                if !hovering { self?.scheduleHoverClose() }
-                else { self?.hoverCloseWorkItem?.cancel() }
-            }
-        ))
+        detailModel.presentation = presentation
+        detailModel.actions = actions
     }
 
     private func showSettingsMenu() {
@@ -161,7 +248,7 @@ final class StatusBarController: NSObject {
             keyEquivalent: ""
         )
         dynamic.target = self
-        dynamic.state = preferences.dynamicIconEnabled ? .on : .off
+        dynamic.state = presentation.dynamicIconEnabled ? .on : .off
         menu.addItem(dynamic)
 
         let launch = NSMenuItem(
@@ -170,7 +257,7 @@ final class StatusBarController: NSObject {
             keyEquivalent: ""
         )
         launch.target = self
-        launch.state = preferences.launchWithCodex ? .on : .off
+        launch.state = presentation.launchWithCodex ? .on : .off
         menu.addItem(launch)
         menu.addItem(.separator())
 
@@ -182,7 +269,7 @@ final class StatusBarController: NSObject {
         choose.target = self
         menu.addItem(choose)
 
-        if preferences.pinnedSessionID != nil {
+        if presentation.pinnedSessionID != nil {
             let restore = NSMenuItem(
                 title: "恢复自动跟随",
                 action: #selector(restoreAutomaticFromMenu(_:)),
@@ -200,52 +287,46 @@ final class StatusBarController: NSObject {
     }
 
     @objc private func toggleDynamicFromMenu(_ sender: NSMenuItem) {
-        actions.toggleDynamicIcon(!preferences.dynamicIconEnabled)
+        actions.toggleDynamicIcon(!presentation.dynamicIconEnabled)
     }
 
     @objc private func toggleLaunchFromMenu(_ sender: NSMenuItem) {
-        actions.toggleLaunchWithCodex(!preferences.launchWithCodex)
+        actions.toggleLaunchWithCodex(!presentation.launchWithCodex)
     }
 
     @objc private func chooseCodexHomeFromMenu(_ sender: NSMenuItem) { actions.chooseCodexHome() }
     @objc private func restoreAutomaticFromMenu(_ sender: NSMenuItem) { actions.restoreAutomatic() }
     @objc private func quitFromMenu(_ sender: NSMenuItem) { actions.quit() }
 
-    private var weeklyAccessibilityValue: String {
-        snapshot.weeklyRemainingPercent.map { "\(Int($0.rounded()))%" } ?? "不可用"
-    }
-
-    private func attributedMenuTitle(_ text: String) -> NSAttributedString {
-        let result = NSMutableAttributedString(string: text)
-        let whole = NSRange(location: 0, length: result.length)
-        result.addAttributes([
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
-            .foregroundColor: NSColor.labelColor
-        ], range: whole)
-
-        let weeklyLength: Int
-        let nsText = text as NSString
-        let separator = nsText.range(of: " · ")
-        weeklyLength = separator.location == NSNotFound ? nsText.length : separator.location
-        let color = snapshot.weeklyRemainingPercent.map { percent -> NSColor in
-            let rgb = WeeklyColor.color(remainingPercent: percent)
-            return NSColor(srgbRed: rgb.red, green: rgb.green, blue: rgb.blue, alpha: 1)
+    private func attributedMenuTitle(
+        _ segments: [PulseMenuBarSegment],
+        selected: Bool = false
+    ) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let color = presentation.weeklyColor.map {
+            NSColor(srgbRed: $0.red, green: $0.green, blue: $0.blue, alpha: 1)
         } ?? .secondaryLabelColor
         let shadow = NSShadow()
         shadow.shadowColor = NSColor.black.withAlphaComponent(0.45)
         shadow.shadowBlurRadius = 1
         shadow.shadowOffset = .zero
-        result.addAttributes([
-            .foregroundColor: color,
-            .shadow: shadow
-        ], range: NSRange(location: 0, length: weeklyLength))
+        for segment in segments {
+            var attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
+                .foregroundColor: selected ? NSColor.selectedMenuItemTextColor : NSColor.labelColor
+            ]
+            if segment.usesWeeklyColor && !selected {
+                attributes[.foregroundColor] = color
+                attributes[.shadow] = shadow
+            }
+            result.append(NSAttributedString(string: segment.text, attributes: attributes))
+        }
         return result
     }
 
     private func coloredIcon() -> NSImage {
-        let color = snapshot.weeklyRemainingPercent.map { percent -> NSColor in
-            let rgb = WeeklyColor.color(remainingPercent: percent)
-            return NSColor(srgbRed: rgb.red, green: rgb.green, blue: rgb.blue, alpha: 1)
+        let color = presentation.weeklyColor.map {
+            NSColor(srgbRed: $0.red, green: $0.green, blue: $0.blue, alpha: 1)
         } ?? .secondaryLabelColor
         let source = sourceIcon()
         let size = NSSize(width: 18, height: 18)
@@ -258,6 +339,16 @@ final class StatusBarController: NSObject {
         }
         foreground.draw(in: NSRect(origin: .zero, size: size))
         image.unlockFocus()
+        image.isTemplate = false
+        return image
+    }
+
+    private func highContrastIcon() -> NSImage {
+        let image = mask(
+            source: sourceIcon(),
+            color: .selectedMenuItemTextColor,
+            size: NSSize(width: 18, height: 18)
+        )
         image.isTemplate = false
         return image
     }
@@ -303,25 +394,31 @@ extension StatusBarController: NSPopoverDelegate {
 }
 
 @MainActor
-private final class HoverTrackingView: NSView {
+private final class HoverTrackingOwner: NSResponder {
     var onEntered: () -> Void = {}
     var onExited: () -> Void = {}
+    private weak var view: NSView?
     private var tracking: NSTrackingArea?
 
-    override func updateTrackingAreas() {
-        if let tracking { removeTrackingArea(tracking) }
+    func install(on view: NSView) {
+        uninstall()
         let area = NSTrackingArea(
-            rect: bounds,
+            rect: .zero,
             options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
             owner: self,
             userInfo: nil
         )
-        addTrackingArea(area)
+        view.addTrackingArea(area)
+        self.view = view
         tracking = area
-        super.updateTrackingAreas()
+    }
+
+    func uninstall() {
+        if let tracking, let view { view.removeTrackingArea(tracking) }
+        tracking = nil
+        view = nil
     }
 
     override func mouseEntered(with event: NSEvent) { onEntered() }
     override func mouseExited(with event: NSEvent) { onExited() }
-    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 }

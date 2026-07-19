@@ -32,7 +32,14 @@ final class CodexLifecycleMonitor {
             guard Self.bundleIdentifier(from: notification) == Self.codexBundleIdentifier else { return }
             MainActor.assumeIsolated { self?.onRunningChanged?(false) }
         })
-        onRunningChanged?(isCodexRunning)
+        let initiallyRunning = isCodexRunning
+        Task { @MainActor [weak self] in
+            // Creating an NSStatusItem synchronously from
+            // applicationDidFinishLaunching can leave its window detached from
+            // every screen on macOS 26. Deliver the initial state after AppKit
+            // finishes the current launch callback.
+            self?.onRunningChanged?(initiallyRunning)
+        }
     }
 
     func stop() {
