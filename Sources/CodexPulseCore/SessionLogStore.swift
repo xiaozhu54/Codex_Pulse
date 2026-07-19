@@ -62,9 +62,12 @@ struct SessionState {
     var weeklyUpdatedAt: Date?
     var weeklyIsCodex = false
     var model: String?
+    var modelUpdatedAt: Date?
+    var modelSource: MetricSource?
     var inputTokens: Int?
     var outputTokens: Int?
     var contextWindow: Int?
+    var contextUpdatedAt: Date?
     var indexedAsInternal = false
 
     var hasRecognizableTaskEvent: Bool { latestTaskEventAt != nil }
@@ -77,16 +80,21 @@ struct SessionState {
 
     mutating func apply(metadata: ThreadMetadata) {
         title = metadata.title ?? title
-        model = model ?? metadata.model
+        if model == nil, let indexedModel = metadata.model {
+            model = indexedModel
+            modelUpdatedAt = metadata.updatedAt
+            modelSource = .threadIndex
+        }
         indexedAsInternal = metadata.isInternal
     }
 
     func snapshot(
         selectionMode: SessionSelectionMode,
-        dynamicIconEnabled: Bool,
-        tokenSpeed: TokenSpeed,
-        weeklyRemaining: Double?,
-        weeklyResetsAt: Date?
+        tokenSpeed: MetricValue<TokenSpeed>,
+        weekly: MetricValue<Double>,
+        weeklyResetsAt: MetricValue<Date>,
+        sessionJournalStatus: SourceStatus,
+        threadIndexStatus: SourceStatus
     ) -> StatusSnapshot {
         let usedTokens = inputTokens.flatMap { input in outputTokens.map { input + $0 } }
         let available = usedTokens.flatMap { used in
@@ -97,6 +105,9 @@ struct SessionState {
         let resolvedStage: TaskStage
         if !active { resolvedStage = .idle }
         else if [.usingTool, .waitingForTool, .waitingForApproval].contains(stage) { resolvedStage = stage }
+        else if tokenSpeed.value?.outputKind == .toolCall && tokenSpeed.kind == .estimating {
+            resolvedStage = .usingTool
+        }
         else {
             switch tokenSpeed.kind {
             case .estimating: resolvedStage = .generating
@@ -107,19 +118,32 @@ struct SessionState {
         }
         return StatusSnapshot(
             visibility: active ? .active : .idle,
-            weeklyRemainingPercent: weeklyRemaining,
+            weekly: weekly,
             weeklyResetsAt: weeklyResetsAt,
             tokenSpeed: tokenSpeed,
-            model: model,
-            contextAvailablePercent: available,
+            model: MetricValue(
+                value: model,
+                availability: model == nil
+                    ? .unavailable
+                    : (modelSource == .threadIndex ? threadIndexStatus.availability : sessionJournalStatus.availability),
+                observedAt: modelUpdatedAt ?? updatedAt,
+                source: modelSource ?? .sessionJournal,
+                issue: modelSource == .threadIndex ? threadIndexStatus.issue : sessionJournalStatus.issue
+            ),
+            contextAvailable: MetricValue(
+                value: available,
+                availability: available == nil ? .unavailable : sessionJournalStatus.availability,
+                observedAt: contextUpdatedAt,
+                source: .sessionJournal,
+                issue: sessionJournalStatus.issue
+            ),
             contextUsedTokens: usedTokens,
             contextWindowTokens: contextWindow,
             sessionID: id,
             sessionTitle: title,
             selectionMode: selectionMode,
             stage: resolvedStage,
-            updatedAt: latestTaskEventAt ?? updatedAt,
-            dynamicIconEnabled: dynamicIconEnabled
+            updatedAt: latestTaskEventAt ?? updatedAt
         )
     }
 }
@@ -134,7 +158,11 @@ enum SessionLogParser {
         case "session_meta":
             state.id = (payload["id"] as? String) ?? (payload["session_id"] as? String) ?? state.id
         case "turn_context":
-            state.model = (payload["model"] as? String) ?? state.model
+            if let model = payload["model"] as? String {
+                state.model = model
+                state.modelUpdatedAt = timestamp ?? state.updatedAt
+                state.modelSource = .sessionJournal
+            }
         case "event_msg": applyEvent(payload, timestamp: timestamp, to: &state)
         case "response_item": applyResponseItem(payload, timestamp: timestamp, to: &state)
         default: break
@@ -178,6 +206,9 @@ enum SessionLogParser {
             state.inputTokens = (usage?["input_tokens"] as? NSNumber)?.intValue ?? state.inputTokens
             state.outputTokens = (usage?["output_tokens"] as? NSNumber)?.intValue ?? state.outputTokens
             state.contextWindow = (info["model_context_window"] as? NSNumber)?.intValue ?? state.contextWindow
+            if usage != nil || info["model_context_window"] != nil {
+                state.contextUpdatedAt = timestamp ?? state.updatedAt
+            }
         }
         guard let rateLimits = payload["rate_limits"] as? [String: Any] else { return }
         let limitID = rateLimits["limit_id"] as? String

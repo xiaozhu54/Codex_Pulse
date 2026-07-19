@@ -54,21 +54,14 @@ public enum TaskStage: String, Equatable, Sendable {
     case finishing
     case unavailable
 
-    public var displayName: String {
-        switch self {
-        case .idle: "空闲"
-        case .thinking: "推理中"
-        case .generating: "生成中"
-        case .usingTool: "调用工具"
-        case .waitingForTool: "等待工具"
-        case .waitingForApproval: "等待审批"
-        case .finishing: "收尾中"
-        case .unavailable: "状态不可用"
-        }
-    }
 }
 
 public struct TokenSpeed: Equatable, Sendable {
+    public enum OutputKind: Equatable, Sendable {
+        case text
+        case toolCall
+    }
+
     public enum Kind: Equatable, Sendable {
         case estimating
         case final
@@ -79,36 +72,134 @@ public struct TokenSpeed: Equatable, Sendable {
     public let kind: Kind
     public let tokensPerSecond: Double?
     public let recentAverage: Double?
+    public let outputKind: OutputKind?
 
-    public init(kind: Kind, tokensPerSecond: Double? = nil, recentAverage: Double? = nil) {
+    public init(
+        kind: Kind,
+        tokensPerSecond: Double? = nil,
+        recentAverage: Double? = nil,
+        outputKind: OutputKind? = nil
+    ) {
         self.kind = kind
         self.tokensPerSecond = tokensPerSecond
         self.recentAverage = recentAverage
+        self.outputKind = outputKind
     }
 
     public static let unavailable = TokenSpeed(kind: .unavailable)
 
-    public var compactText: String {
-        switch (kind, tokensPerSecond) {
-        case (.estimating, let value?): "≈\(Self.format(value)) t/s"
-        case (.final, let value?): "\(Self.format(value)) t/s"
-        case (.thinking, _): "推理中…"
-        default: "— t/s"
-        }
+}
+
+public enum MetricAvailability: String, Equatable, Sendable {
+    case available
+    case stale
+    case unavailable
+}
+
+public enum MetricSource: String, Equatable, Sendable {
+    case sessionJournal
+    case threadIndex
+    case responseLog
+    case derived
+}
+
+public enum SourceIssue: String, Equatable, Sendable {
+    case missing
+    case incompatible
+    case busy
+    case readFailed
+    case rotated
+}
+
+public struct MetricValue<Value: Equatable & Sendable>: Equatable, Sendable {
+    public let value: Value?
+    public let availability: MetricAvailability
+    public let observedAt: Date?
+    public let source: MetricSource?
+    public let issue: SourceIssue?
+
+    public init(
+        value: Value?,
+        availability: MetricAvailability? = nil,
+        observedAt: Date? = nil,
+        source: MetricSource? = nil,
+        issue: SourceIssue? = nil
+    ) {
+        self.value = value
+        self.availability = availability ?? (value == nil ? .unavailable : .available)
+        self.observedAt = observedAt
+        self.source = source
+        self.issue = issue
     }
 
-    private static func format(_ value: Double) -> String {
-        String(format: "%.1f", value)
+    public static var unavailable: Self { Self(value: nil) }
+}
+
+public extension MetricValue where Value == TokenSpeed {
+    var kind: TokenSpeed.Kind { value?.kind ?? .unavailable }
+    var tokensPerSecond: Double? { value?.tokensPerSecond }
+    var recentAverage: Double? { value?.recentAverage }
+}
+
+public enum LaunchMonitorStatus: String, Equatable, Sendable {
+    case enabled
+    case disabled
+    case requiresApproval
+    case unavailable
+    case failed
+    case unknown
+}
+
+public struct SourceStatus: Equatable, Sendable {
+    public let availability: MetricAvailability
+    public let observedAt: Date?
+    public let issue: SourceIssue?
+
+    public init(
+        availability: MetricAvailability,
+        observedAt: Date? = nil,
+        issue: SourceIssue? = nil
+    ) {
+        self.availability = availability
+        self.observedAt = observedAt
+        self.issue = issue
     }
+
+    public static let available = SourceStatus(availability: .available)
+    public static let unavailable = SourceStatus(availability: .unavailable)
+}
+
+public struct SourceHealth: Equatable, Sendable {
+    public let sessionJournal: SourceStatus
+    public let threadIndex: SourceStatus
+    public let responseLog: SourceStatus
+
+    public init(sessionJournal: SourceStatus, threadIndex: SourceStatus, responseLog: SourceStatus) {
+        self.sessionJournal = sessionJournal
+        self.threadIndex = threadIndex
+        self.responseLog = responseLog
+    }
+
+    public static let allAvailable = SourceHealth(
+        sessionJournal: .available,
+        threadIndex: .available,
+        responseLog: .available
+    )
+
+    public static let unavailable = SourceHealth(
+        sessionJournal: .unavailable,
+        threadIndex: .unavailable,
+        responseLog: .unavailable
+    )
 }
 
 public struct StatusSnapshot: Equatable, Sendable {
     public let visibility: PulseVisibility
-    public let weeklyRemainingPercent: Double?
-    public let weeklyResetsAt: Date?
-    public let tokenSpeed: TokenSpeed
-    public let model: String?
-    public let contextAvailablePercent: Double?
+    public let weekly: MetricValue<Double>
+    public let weeklyResetsAt: MetricValue<Date>
+    public let tokenSpeed: MetricValue<TokenSpeed>
+    public let model: MetricValue<String>
+    public let contextAvailable: MetricValue<Double>
     public let contextUsedTokens: Int?
     public let contextWindowTokens: Int?
     public let sessionID: String?
@@ -116,30 +207,28 @@ public struct StatusSnapshot: Equatable, Sendable {
     public let selectionMode: SessionSelectionMode
     public let stage: TaskStage
     public let updatedAt: Date?
-    public let dynamicIconEnabled: Bool
 
     public init(
         visibility: PulseVisibility,
-        weeklyRemainingPercent: Double? = nil,
-        weeklyResetsAt: Date? = nil,
-        tokenSpeed: TokenSpeed = .unavailable,
-        model: String? = nil,
-        contextAvailablePercent: Double? = nil,
+        weekly: MetricValue<Double> = .unavailable,
+        weeklyResetsAt: MetricValue<Date> = .unavailable,
+        tokenSpeed: MetricValue<TokenSpeed> = .unavailable,
+        model: MetricValue<String> = .unavailable,
+        contextAvailable: MetricValue<Double> = .unavailable,
         contextUsedTokens: Int? = nil,
         contextWindowTokens: Int? = nil,
         sessionID: String? = nil,
         sessionTitle: String? = nil,
         selectionMode: SessionSelectionMode = .automatic,
         stage: TaskStage = .idle,
-        updatedAt: Date? = nil,
-        dynamicIconEnabled: Bool = false
+        updatedAt: Date? = nil
     ) {
         self.visibility = visibility
-        self.weeklyRemainingPercent = weeklyRemainingPercent
+        self.weekly = weekly
         self.weeklyResetsAt = weeklyResetsAt
         self.tokenSpeed = tokenSpeed
         self.model = model
-        self.contextAvailablePercent = contextAvailablePercent
+        self.contextAvailable = contextAvailable
         self.contextUsedTokens = contextUsedTokens
         self.contextWindowTokens = contextWindowTokens
         self.sessionID = sessionID
@@ -147,34 +236,37 @@ public struct StatusSnapshot: Equatable, Sendable {
         self.selectionMode = selectionMode
         self.stage = stage
         self.updatedAt = updatedAt
-        self.dynamicIconEnabled = dynamicIconEnabled
     }
 
     public static let hidden = StatusSnapshot(visibility: .hidden)
 
-    public var menuBarText: String {
-        guard visibility != .hidden else { return "" }
-        let weekly = weeklyRemainingPercent.map { "W \(Int($0.rounded()))%" } ?? "W —"
-        guard visibility == .active else { return weekly }
-        return [
-            weekly,
-            tokenSpeed.compactText,
-            ModelName.short(model),
-            contextAvailablePercent.map { "Ctx \(Int($0.rounded()))%" } ?? "Ctx —"
-        ].joined(separator: " · ")
-    }
+    public var weeklyRemainingPercent: Double? { weekly.value }
+    public var weeklyResetDate: Date? { weeklyResetsAt.value }
+    public var contextAvailablePercent: Double? { contextAvailable.value }
 }
 
-public enum ModelName {
-    public static func short(_ identifier: String?) -> String {
-        guard let identifier, !identifier.isEmpty else { return "—" }
-        let lower = identifier.lowercased()
-        if lower.hasPrefix("gpt-") {
-            let components = identifier.split(separator: "-")
-            if components.count >= 2 {
-                return "GPT‑\(components[1])"
-            }
-        }
-        return identifier
+public struct PulseState: Equatable, Sendable {
+    public let snapshot: StatusSnapshot
+    public let sessions: [SessionSummary]
+    public let sourceHealth: SourceHealth
+
+    public init(snapshot: StatusSnapshot, sessions: [SessionSummary], sourceHealth: SourceHealth) {
+        self.snapshot = snapshot
+        self.sessions = sessions
+        self.sourceHealth = sourceHealth
+    }
+
+    public static let hidden = PulseState(snapshot: .hidden, sessions: [], sourceHealth: .unavailable)
+}
+
+public struct PulseRefreshRequest: Equatable, Sendable {
+    public let codexRunning: Bool
+    public let pinnedSessionID: String?
+    public let now: Date
+
+    public init(codexRunning: Bool, pinnedSessionID: String?, now: Date = Date()) {
+        self.codexRunning = codexRunning
+        self.pinnedSessionID = pinnedSessionID
+        self.now = now
     }
 }

@@ -4,7 +4,7 @@ import CodexPulseCore
 
 @main
 struct CodexPulseBehaviorTests {
-    static func main() throws {
+    static func main() async throws {
         try idleShowsOnlyWeeklyRemaining()
         print("PASS: Codex idle shows only weekly remaining")
         try internalReviewDoesNotReplaceActiveMainTask()
@@ -35,6 +35,22 @@ struct CodexPulseBehaviorTests {
         print("PASS: Valid pin overrides automatic following")
         try minimalSchemaAndBusyWALDegradeSafely()
         print("PASS: Minimal schema and busy WAL degrade safely")
+        try refreshReturnsOneCoherentPulseState()
+        print("PASS: Refresh returns one coherent PulseState")
+        try presenterOwnsAllMenuBarFormatting()
+        print("PASS: Presenter owns menu bar formatting")
+        try responseMetricsSurviveSessionSwitches()
+        print("PASS: Response metrics survive session switches")
+        try incompatibleNewestLogFallsBackToCompatibleDatabase()
+        print("PASS: Incompatible newest log falls back safely")
+        try refreshAndStatusItemRecoveryPoliciesAreDeterministic()
+        print("PASS: Refresh and status-item recovery policies are deterministic")
+        try presenterSuppressesStaleValuesAndExplainsSourceHealth()
+        print("PASS: Presenter suppresses stale values and explains source health")
+        try oneBrokenIndexedSessionDoesNotEraseHealthySessions()
+        print("PASS: A broken indexed session is isolated")
+        try await runtimeLifecycleProducesFinalViewState()
+        print("PASS: Runtime lifecycle produces the final view state")
     }
 
     private static func idleShowsOnlyWeeklyRemaining() throws {
@@ -51,13 +67,12 @@ struct CodexPulseBehaviorTests {
         )
 
         let engine = CodexPulseEngine(codexHome: fixture.url)
-        let snapshot = try engine.snapshot(
-            codexRunning: true,
-            preferences: PulsePreferences()
-        )
+        let state = try engine.refresh(.init(codexRunning: true, pinnedSessionID: nil))
+        let snapshot = state.snapshot
+        let viewState = PulsePresenter.present(state: state, preferences: PulsePreferences())
 
         try expect(snapshot.visibility == .idle, "expected idle visibility")
-        try expect(snapshot.menuBarText == "W 75%", "expected compact weekly menu text")
+        try expect(viewState.menuBarText == "W 75%", "expected compact weekly menu text")
         try expect(snapshot.weeklyRemainingPercent == 75, "expected 75% weekly remaining")
     }
 
@@ -83,15 +98,16 @@ struct CodexPulseBehaviorTests {
             ]
         )
 
-        let snapshot = try CodexPulseEngine(codexHome: fixture.url).snapshot(
-            codexRunning: true,
-            preferences: PulsePreferences()
+        let state = try CodexPulseEngine(codexHome: fixture.url).refresh(
+            .init(codexRunning: true, pinnedSessionID: nil)
         )
+        let snapshot = state.snapshot
 
         try expect(snapshot.sessionID == "main-thread", "expected main thread to win automatic following")
         try expect(snapshot.visibility == .active, "expected active visibility")
         try expect(
-            snapshot.menuBarText == "W 60% · — t/s · GPT‑5.6 · Ctx 74%",
+            PulsePresenter.present(state: state, preferences: PulsePreferences()).menuBarText
+                == "W 60% · — t/s · GPT‑5.6 · Ctx 74%",
             "expected complete active task summary"
         )
     }
@@ -137,10 +153,7 @@ struct CodexPulseBehaviorTests {
             )
         ])
 
-        let snapshot = try CodexPulseEngine(codexHome: fixture.url).snapshot(
-            codexRunning: true,
-            preferences: PulsePreferences()
-        )
+        let snapshot = try refreshSnapshot(CodexPulseEngine(codexHome: fixture.url))
 
         try expect(snapshot.sessionID == "main-thread", "expected subagent to be excluded")
         try expect(snapshot.sessionTitle == "Pinned task", "expected title from thread index")
@@ -157,9 +170,9 @@ struct CodexPulseBehaviorTests {
             ]
         )
 
-        let snapshot = try CodexPulseEngine(codexHome: fixture.url).snapshot(
-            codexRunning: true,
-            preferences: PulsePreferences(pinnedSessionID: "missing-thread")
+        let snapshot = try refreshSnapshot(
+            CodexPulseEngine(codexHome: fixture.url),
+            pinnedSessionID: "missing-thread"
         )
 
         try expect(snapshot.selectionMode == .pinnedUnavailable, "expected unavailable pinned state")
@@ -200,19 +213,29 @@ struct CodexPulseBehaviorTests {
             )
         ])
 
-        let snapshot = try CodexPulseEngine(codexHome: fixture.url).snapshot(
-            codexRunning: true,
-            preferences: PulsePreferences(),
-            now: Date(timeIntervalSince1970: TimeInterval(start + 2))
+        let state = try CodexPulseEngine(codexHome: fixture.url).refresh(
+            .init(
+                codexRunning: true,
+                pinnedSessionID: nil,
+                now: Date(timeIntervalSince1970: TimeInterval(start + 2))
+            )
         )
+        let snapshot = state.snapshot
 
         try expect(snapshot.tokenSpeed.kind == .estimating, "expected a live estimate")
         try expect(
             snapshot.tokenSpeed.tokensPerSecond == 2,
             "expected four estimated tokens over two seconds, got \(String(describing: snapshot.tokenSpeed.tokensPerSecond))"
         )
-        try expect(snapshot.menuBarText.contains("≈2.0 t/s"), "expected estimated speed in menu bar")
-        try expect(snapshot.stage == .generating, "expected generating stage")
+        try expect(
+            PulsePresenter.present(state: state, preferences: PulsePreferences()).menuBarText.contains("≈2.0 t/s"),
+            "expected estimated speed in menu bar"
+        )
+        try expect(snapshot.stage == .usingTool, "expected tool-call argument generation stage")
+        try expect(
+            PulsePresenter.present(state: state, preferences: PulsePreferences()).detail.stage == "调用工具",
+            "expected PRD tool-call stage label"
+        )
     }
 
     private static func completedResponsesCalibrateWithoutToolWait() throws {
@@ -233,9 +256,8 @@ struct CodexPulseBehaviorTests {
             .init(timestamp: start + 102, nanoseconds: 0, threadID: "main-thread", body: #"SSE event: {"type":"response.completed","response":{"id":"response-2","usage":{"output_tokens":10,"output_tokens_details":{"reasoning_tokens":4}}}}"#)
         ])
 
-        let snapshot = try CodexPulseEngine(codexHome: fixture.url).snapshot(
-            codexRunning: true,
-            preferences: PulsePreferences(),
+        let snapshot = try refreshSnapshot(
+            CodexPulseEngine(codexHome: fixture.url),
             now: Date(timeIntervalSince1970: TimeInterval(start + 102))
         )
 
@@ -272,10 +294,7 @@ struct CodexPulseBehaviorTests {
             ]
         )
 
-        let snapshot = try CodexPulseEngine(codexHome: fixture.url).snapshot(
-            codexRunning: true,
-            preferences: PulsePreferences()
-        )
+        let snapshot = try refreshSnapshot(CodexPulseEngine(codexHome: fixture.url))
 
         try expect(snapshot.visibility == .active, "expected tool call to remain active")
         try expect(snapshot.stage == .waitingForTool, "expected waiting-for-tool stage")
@@ -293,7 +312,7 @@ struct CodexPulseBehaviorTests {
             ]
         )
         let engine = CodexPulseEngine(codexHome: fixture.url)
-        let before = try engine.snapshot(codexRunning: true, preferences: PulsePreferences())
+        let before = try refreshSnapshot(engine)
         try expect(
             abs((before.contextAvailablePercent ?? -1) - 10) < 0.001,
             "expected 10% context before compaction"
@@ -302,14 +321,14 @@ struct CodexPulseBehaviorTests {
         let compacted = #"{"timestamp":"2026-07-16T01:10:03Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":25000,"output_tokens":5000},"model_context_window":100000},"rate_limits":{}}}"#
         let split = compacted.index(compacted.startIndex, offsetBy: compacted.count / 2)
         try fixture.appendToSession(id: "main-thread", text: String(compacted[..<split]))
-        let whilePartial = try engine.snapshot(codexRunning: true, preferences: PulsePreferences())
+        let whilePartial = try refreshSnapshot(engine)
         try expect(
             abs((whilePartial.contextAvailablePercent ?? -1) - 10) < 0.001,
             "expected incomplete JSON to be ignored"
         )
 
         try fixture.appendToSession(id: "main-thread", text: String(compacted[split...]) + "\n")
-        let after = try engine.snapshot(codexRunning: true, preferences: PulsePreferences())
+        let after = try refreshSnapshot(engine)
         try expect(
             abs((after.contextAvailablePercent ?? -1) - 70) < 0.001,
             "expected context to recover after compaction"
@@ -327,9 +346,7 @@ struct CodexPulseBehaviorTests {
             #"{"timestamp":"2026-07-16T01:21:00Z","type":"session_meta","payload":{"id":"active"}}"#,
             #"{"timestamp":"2026-07-16T01:21:01Z","type":"event_msg","payload":{"type":"task_started"}}"#
         ])
-        let snapshot = try CodexPulseEngine(codexHome: fixture.url).snapshot(
-            codexRunning: true, preferences: PulsePreferences()
-        )
+        let snapshot = try refreshSnapshot(CodexPulseEngine(codexHome: fixture.url))
         try expect(snapshot.sessionID == "active", "expected current task to remain selected")
         try expect(snapshot.weeklyRemainingPercent == 68, "expected newest Codex weekly record globally")
     }
@@ -345,9 +362,7 @@ struct CodexPulseBehaviorTests {
             #"{"timestamp":"2026-07-16T01:31:00Z","type":"event_msg","payload":{"type":"task_started"}}"#
         ])
         try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1)], ofItemAtPath: newer.path)
-        let snapshot = try CodexPulseEngine(codexHome: fixture.url).snapshot(
-            codexRunning: true, preferences: PulsePreferences()
-        )
+        let snapshot = try refreshSnapshot(CodexPulseEngine(codexHome: fixture.url))
         try expect(snapshot.sessionID == "newer", "expected event time, not file mtime, to select task")
     }
 
@@ -357,31 +372,32 @@ struct CodexPulseBehaviorTests {
             #"{"timestamp":"2026-07-16T01:40:00Z","type":"event_msg","payload":{"type":"task_started"}}"#
         ])
         let engine = CodexPulseEngine(codexHome: fixture.url)
-        _ = try engine.snapshot(codexRunning: true, preferences: PulsePreferences())
+        _ = try refreshSnapshot(engine)
         let quota = #"{"timestamp":"2026-07-16T01:40:01Z","type":"event_msg","payload":{"type":"token_count","info":{},"rate_limits":{"limit_id":"codex","primary":{"used_percent":10,"window_minutes":10080}}}}"#
         try fixture.appendToSession(id: "main-thread", text: quota)
-        let incomplete = try engine.snapshot(codexRunning: true, preferences: PulsePreferences())
+        let incomplete = try refreshSnapshot(engine)
         try expect(incomplete.weeklyRemainingPercent == nil, "expected newline-free JSON to remain buffered")
         try fixture.appendToSession(id: "main-thread", text: "\n")
-        let complete = try engine.snapshot(codexRunning: true, preferences: PulsePreferences())
+        let complete = try refreshSnapshot(engine)
         try expect(complete.weeklyRemainingPercent == 90, "expected newline to commit buffered JSON")
 
         try fixture.replaceSession(id: "main-thread", lines: [
             #"{"timestamp":"2026-07-16T01:41:00Z","type":"event_msg","payload":{"type":"task_started"}}"#,
             #"{"timestamp":"2026-07-16T01:41:01Z","type":"event_msg","payload":{"type":"token_count","info":{},"rate_limits":{"limit_id":"codex","primary":{"used_percent":80,"window_minutes":10080}}}}"#
         ])
-        let rotated = try engine.snapshot(codexRunning: true, preferences: PulsePreferences())
+        let rotated = try refreshSnapshot(engine)
         try expect(rotated.weeklyRemainingPercent == 20, "expected replacement to reset cursor and state")
     }
 
     private static func presentationKeepsUnknownWeeklyNeutral() throws {
         let snapshot = StatusSnapshot(visibility: .idle)
-        let text = MenuBarPresentation(snapshot: snapshot, preferences: PulsePreferences())
-        let icon = MenuBarPresentation(
-            snapshot: snapshot,
+        let state = PulseState(snapshot: snapshot, sessions: [], sourceHealth: .unavailable)
+        let text = PulsePresenter.present(state: state, preferences: PulsePreferences())
+        let icon = PulsePresenter.present(
+            state: state,
             preferences: PulsePreferences(dynamicIconEnabled: true)
         )
-        try expect(text.mode == .text && text.text == "W —", "expected idle text presentation")
+        try expect(text.mode == .text && text.menuBarText == "W —", "expected idle text presentation")
         try expect(text.weeklyColor == nil && icon.weeklyColor == nil, "expected unknown quota to have no orange color")
         try expect(icon.mode == .icon, "expected dynamic icon presentation mode")
     }
@@ -396,9 +412,9 @@ struct CodexPulseBehaviorTests {
             #"{"timestamp":"2026-07-16T01:51:00Z","type":"session_meta","payload":{"id":"newer"}}"#,
             #"{"timestamp":"2026-07-16T01:51:01Z","type":"event_msg","payload":{"type":"task_started"}}"#
         ])
-        let snapshot = try CodexPulseEngine(codexHome: fixture.url).snapshot(
-            codexRunning: true,
-            preferences: PulsePreferences(pinnedSessionID: "pinned")
+        let snapshot = try refreshSnapshot(
+            CodexPulseEngine(codexHome: fixture.url),
+            pinnedSessionID: "pinned"
         )
         try expect(snapshot.sessionID == "pinned", "expected pin to override newer task")
         try expect(snapshot.selectionMode == .pinned, "expected pinned selection mode")
@@ -412,17 +428,268 @@ struct CodexPulseBehaviorTests {
         ])
         try fixture.writeMinimalThreadIndex(id: "main-thread", rolloutPath: path.path)
         try fixture.withBusyWALThreadIndex {
-            let snapshot = try CodexPulseEngine(codexHome: fixture.url).snapshot(
-                codexRunning: true,
-                preferences: PulsePreferences()
-            )
+            let snapshot = try refreshSnapshot(CodexPulseEngine(codexHome: fixture.url))
             try expect(snapshot.sessionID == "main-thread", "expected optional-column degradation to preserve session")
             try expect(snapshot.visibility == .active, "expected busy WAL read to remain available")
         }
     }
 
+    private static func refreshReturnsOneCoherentPulseState() throws {
+        let fixture = try CodexHomeFixture()
+        try fixture.writeSession(id: "main-thread", title: "Version 2", lines: [
+            #"{"timestamp":"2026-07-16T02:10:00Z","type":"session_meta","payload":{"id":"main-thread"}}"#,
+            #"{"timestamp":"2026-07-16T02:10:01Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+            #"{"timestamp":"2026-07-16T02:10:02Z","type":"event_msg","payload":{"type":"token_count","info":{},"rate_limits":{"limit_id":"codex","primary":{"used_percent":20,"window_minutes":10080}}}}"#
+        ])
+
+        let state = try CodexPulseEngine(codexHome: fixture.url).refresh(
+            PulseRefreshRequest(codexRunning: true, pinnedSessionID: nil)
+        )
+
+        try expect(state.snapshot.sessionID == "main-thread", "expected selected session in PulseState")
+        try expect(state.sessions.map(\.id) == ["main-thread"], "expected sessions from the same refresh")
+        try expect(state.snapshot.weekly.value == 80, "expected metric-level weekly value")
+        try expect(state.snapshot.weekly.availability == .available, "expected weekly availability")
+    }
+
+    private static func presenterOwnsAllMenuBarFormatting() throws {
+        let snapshot = StatusSnapshot(
+            visibility: .active,
+            weekly: MetricValue(value: 64.4, observedAt: Date(timeIntervalSince1970: 10), source: .sessionJournal),
+            tokenSpeed: MetricValue(
+                value: TokenSpeed(kind: .estimating, tokensPerSecond: 42.3),
+                observedAt: Date(timeIntervalSince1970: 11),
+                source: .responseLog
+            ),
+            model: MetricValue(value: "gpt-5.6-sol", observedAt: Date(timeIntervalSince1970: 12), source: .sessionJournal),
+            contextAvailable: MetricValue(value: 89, observedAt: Date(timeIntervalSince1970: 12), source: .sessionJournal),
+            stage: .generating
+        )
+        let state = PulseState(snapshot: snapshot, sessions: [], sourceHealth: .allAvailable)
+
+        let text = PulsePresenter.present(state: state, preferences: PulsePreferences())
+        let icon = PulsePresenter.present(
+            state: state,
+            preferences: PulsePreferences(dynamicIconEnabled: true)
+        )
+
+        try expect(text.mode == .text, "expected text presentation")
+        try expect(text.menuBarText == "W 64% · ≈42.3 t/s · GPT‑5.6 · Ctx 89%", "expected presenter formatting")
+        try expect(icon.mode == .icon && icon.menuBarText.isEmpty, "expected icon-only presentation")
+        try expect(text.accessibilityLabel.contains("Weekly 64%"), "expected presenter accessibility text")
+
+        let thinkingState = PulseState(
+            snapshot: StatusSnapshot(
+                visibility: .active,
+                tokenSpeed: MetricValue(value: TokenSpeed(kind: .thinking)),
+                model: MetricValue(value: "vendor-gpt-5-proxy")
+            ),
+            sessions: [],
+            sourceHealth: .allAvailable
+        )
+        let thinking = PulsePresenter.present(state: thinkingState, preferences: PulsePreferences())
+        try expect(thinking.menuBarText.contains("推理中…"), "expected PRD hidden-reasoning text")
+        try expect(thinking.menuBarText.contains("vendor-gpt-5-proxy"), "expected unknown model to remain ungrouped")
+    }
+
+    private static func responseMetricsSurviveSessionSwitches() throws {
+        let fixture = try CodexHomeFixture()
+        for id in ["one", "two"] {
+            try fixture.writeSession(id: id, title: id, lines: [
+                #"{"timestamp":"2026-07-16T02:20:00Z","type":"session_meta","payload":{"id":"\#(id)"}}"#,
+                #"{"timestamp":"2026-07-16T02:20:01Z","type":"event_msg","payload":{"type":"task_started"}}"#
+            ])
+        }
+        let start: Int64 = 1_784_200_000
+        try fixture.writeLogs(rows: [
+            .init(timestamp: start, nanoseconds: 0, threadID: "one", body: #"SSE event: {"type":"response.created","response":{"id":"one-response"}}"#),
+            .init(timestamp: start + 2, nanoseconds: 0, threadID: "one", body: #"SSE event: {"type":"response.completed","response":{"id":"one-response","usage":{"output_tokens":20}}}"#),
+            .init(timestamp: start + 3, nanoseconds: 0, threadID: "two", body: #"SSE event: {"type":"response.created","response":{"id":"two-response"}}"#),
+            .init(timestamp: start + 5, nanoseconds: 0, threadID: "two", body: #"SSE event: {"type":"response.completed","response":{"id":"two-response","usage":{"output_tokens":8}}}"#)
+        ])
+        let engine = CodexPulseEngine(codexHome: fixture.url)
+        let first = try engine.refresh(.init(codexRunning: true, pinnedSessionID: "one", now: Date(timeIntervalSince1970: TimeInterval(start + 5))))
+        _ = try engine.refresh(.init(codexRunning: true, pinnedSessionID: "two", now: Date(timeIntervalSince1970: TimeInterval(start + 5))))
+        let again = try engine.refresh(.init(codexRunning: true, pinnedSessionID: "one", now: Date(timeIntervalSince1970: TimeInterval(start + 5))))
+
+        try expect(first.snapshot.tokenSpeed.value?.tokensPerSecond == 10, "expected first session speed")
+        try expect(again.snapshot.tokenSpeed.value?.recentAverage == 10, "expected session accumulator to survive switching")
+    }
+
+    private static func incompatibleNewestLogFallsBackToCompatibleDatabase() throws {
+        let fixture = try CodexHomeFixture()
+        try fixture.writeSession(id: "main-thread", title: "Fallback", lines: [
+            #"{"timestamp":"2026-07-16T02:30:00Z","type":"session_meta","payload":{"id":"main-thread"}}"#,
+            #"{"timestamp":"2026-07-16T02:30:01Z","type":"event_msg","payload":{"type":"task_started"}}"#
+        ])
+        let start: Int64 = 1_784_300_000
+        try fixture.writeLogs(databaseName: "logs_8.sqlite", rows: [
+            .init(timestamp: start, nanoseconds: 0, threadID: "main-thread", body: #"SSE event: {"type":"response.created","response":{"id":"response"}}"#),
+            .init(timestamp: start + 2, nanoseconds: 0, threadID: "main-thread", body: #"SSE event: {"type":"response.completed","response":{"id":"response","usage":{"output_tokens":12}}}"#)
+        ])
+        try fixture.writeIncompatibleLog(databaseName: "logs_9.sqlite")
+
+        let state = try CodexPulseEngine(codexHome: fixture.url).refresh(
+            .init(codexRunning: true, pinnedSessionID: nil, now: Date(timeIntervalSince1970: TimeInterval(start + 2)))
+        )
+        try expect(state.snapshot.tokenSpeed.value?.tokensPerSecond == 6, "expected compatible log fallback")
+        try expect(state.sourceHealth.responseLog.availability == .available, "expected fallback source to be healthy")
+    }
+
+    private static func refreshAndStatusItemRecoveryPoliciesAreDeterministic() throws {
+        try expect(
+            PulseRefreshPolicy.interval(codexRunning: false, visibility: .hidden) == nil,
+            "expected stopped observation when Codex is absent"
+        )
+        try expect(
+            PulseRefreshPolicy.interval(codexRunning: true, visibility: .active) == 0.5,
+            "expected active sampling cadence"
+        )
+        try expect(
+            PulseRefreshPolicy.interval(codexRunning: true, visibility: .idle) == 30,
+            "expected low-frequency idle recovery"
+        )
+        let blocked = StatusItemHealth(
+            isVisible: true,
+            hasButton: true,
+            hasWindow: false,
+            hasScreen: false,
+            width: 24
+        )
+        try expect(StatusItemRecoveryPolicy.action(for: blocked, attempt: 0) == .refresh, "expected gentle first recovery")
+        try expect(StatusItemRecoveryPolicy.action(for: blocked, attempt: 1) == .rebuild, "expected bounded rebuild")
+        try expect(StatusItemRecoveryPolicy.action(for: blocked, attempt: 2) == .guideUser, "expected user guidance after bounded recovery")
+    }
+
+    private static func presenterSuppressesStaleValuesAndExplainsSourceHealth() throws {
+        let staleWeekly = MetricValue(
+            value: 0.0,
+            availability: .stale,
+            source: .sessionJournal,
+            issue: .readFailed
+        )
+        let state = PulseState(
+            snapshot: StatusSnapshot(visibility: .idle, weekly: staleWeekly),
+            sessions: [],
+            sourceHealth: SourceHealth(
+                sessionJournal: SourceStatus(availability: .stale, issue: .readFailed),
+                threadIndex: .available,
+                responseLog: SourceStatus(availability: .unavailable, issue: .incompatible)
+            )
+        )
+
+        let view = PulsePresenter.present(state: state, preferences: PulsePreferences())
+        try expect(view.menuBarText == "W —", "expected stale weekly value to be hidden")
+        try expect(view.weeklyColor == nil, "expected no misleading 0% orange color")
+        try expect(
+            view.detail.metrics.contains { $0.label == "会话数据" && $0.value.contains("读取失败") },
+            "expected session source health in the detail view"
+        )
+        try expect(
+            view.detail.metrics.contains { $0.label == "响应日志" && $0.value.contains("格式不兼容") },
+            "expected response source incompatibility in the detail view"
+        )
+    }
+
+    private static func oneBrokenIndexedSessionDoesNotEraseHealthySessions() throws {
+        let fixture = try CodexHomeFixture()
+        let healthy = try fixture.writeSession(id: "healthy", title: "Healthy", lines: [
+            #"{"timestamp":"2026-07-16T03:00:00Z","type":"session_meta","payload":{"id":"healthy"}}"#,
+            #"{"timestamp":"2026-07-16T03:00:00Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#,
+            #"{"timestamp":"2026-07-16T03:00:01Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+            #"{"timestamp":"2026-07-16T03:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10000,"output_tokens":1000},"model_context_window":100000},"rate_limits":{"limit_id":"codex","primary":{"used_percent":25,"window_minutes":10080}}}}"#
+        ])
+        let missing = fixture.url.appendingPathComponent("sessions/missing.jsonl")
+        try fixture.writeThreadIndex(rows: [
+            .init(
+                id: "healthy",
+                rolloutPath: healthy.path,
+                updatedAt: 2,
+                title: "Healthy",
+                model: nil,
+                agentPath: nil,
+                threadSource: "user"
+            ),
+            .init(
+                id: "broken",
+                rolloutPath: missing.path,
+                updatedAt: 1,
+                title: "Broken",
+                model: nil,
+                agentPath: nil,
+                threadSource: "user"
+            )
+        ])
+
+        let state = try CodexPulseEngine(codexHome: fixture.url).refresh(
+            .init(codexRunning: true, pinnedSessionID: nil)
+        )
+        try expect(state.snapshot.sessionID == "healthy", "expected the healthy session to remain selected")
+        try expect(state.sessions.map(\.id) == ["healthy"], "expected the broken file to be isolated")
+        try expect(state.sourceHealth.sessionJournal.availability == .stale, "expected partial failure health")
+        try expect(state.snapshot.model.availability == .available, "expected healthy model availability")
+        try expect(state.snapshot.contextAvailable.availability == .available, "expected healthy context availability")
+        let view = PulsePresenter.present(state: state, preferences: PulsePreferences())
+        try expect(view.menuBarText.hasPrefix("W 75%"), "expected healthy fields to degrade independently")
+        try expect(view.menuBarText.contains("GPT‑5.6 · Ctx 89%"), "expected healthy model and context to remain visible")
+    }
+
+    private static func runtimeLifecycleProducesFinalViewState() async throws {
+        let fixture = try CodexHomeFixture()
+        try fixture.writeSession(id: "main-thread", title: "Lifecycle", lines: [
+            #"{"timestamp":"2026-07-16T03:10:00Z","type":"session_meta","payload":{"id":"main-thread"}}"#,
+            #"{"timestamp":"2026-07-16T03:10:01Z","type":"event_msg","payload":{"type":"task_started"}}"#,
+            #"{"timestamp":"2026-07-16T03:10:02Z","type":"event_msg","payload":{"type":"token_count","info":{},"rate_limits":{"limit_id":"codex","primary":{"used_percent":35,"window_minutes":10080}}}}"#
+        ])
+        let runtime = PulseRuntime(codexHome: fixture.url)
+        var application = PulseApplicationModel()
+        let stopped = application.lifecycleChanged(
+            codexRunning: false,
+            preferences: PulsePreferences(),
+            codexHomePath: fixture.url.path,
+            launchMonitorStatus: .disabled
+        )
+        try expect(stopped.viewState.mode == .hidden, "expected stopped lifecycle state")
+        try expect(stopped.shouldTerminate, "expected the application model to terminate with Codex")
+
+        let started = application.lifecycleChanged(
+            codexRunning: true,
+            preferences: PulsePreferences(),
+            codexHomePath: fixture.url.path,
+            launchMonitorStatus: .disabled
+        )
+        try expect(started.shouldRefresh, "expected simulated lifecycle start to request a refresh")
+        try expect(started.viewState.menuBarText == "W —", "expected deterministic launch placeholder")
+
+        let running = await runtime.refresh(.init(codexRunning: true, pinnedSessionID: nil))
+        let final = application.accepted(
+            running,
+            preferences: PulsePreferences(),
+            codexHomePath: fixture.url.path,
+            launchMonitorStatus: .disabled
+        )
+        let view = final.viewState
+        try expect(view.mode == .text && view.menuBarText.hasPrefix("W 65%"), "expected running final UI state")
+        try expect(view.codexHomePath == fixture.url.path, "expected path to travel through PulseViewState")
+        try expect(!view.launchWithCodex, "expected actual launch monitor status in final UI state")
+        try expect(final.refreshInterval == 0.5, "expected active lifecycle cadence")
+        try expect(!application.shouldRefreshForFileEvent, "expected active file events to remain throttled")
+    }
+
     private static func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
         guard condition() else { throw BehaviorTestFailure(message: message) }
+    }
+
+    private static func refreshSnapshot(
+        _ engine: CodexPulseEngine,
+        pinnedSessionID: String? = nil,
+        now: Date = Date()
+    ) throws -> StatusSnapshot {
+        try engine.refresh(PulseRefreshRequest(
+            codexRunning: true,
+            pinnedSessionID: pinnedSessionID,
+            now: now
+        )).snapshot
     }
 }
 
@@ -537,8 +804,8 @@ private final class CodexHomeFixture {
         try body()
     }
 
-    func writeLogs(rows: [LogRow]) throws {
-        let path = url.appendingPathComponent("logs_9.sqlite").path
+    func writeLogs(databaseName: String = "logs_9.sqlite", rows: [LogRow]) throws {
+        let path = url.appendingPathComponent(databaseName).path
         var database: OpaquePointer?
         guard sqlite3_open(path, &database) == SQLITE_OK, let database else {
             throw BehaviorTestFailure(message: "could not create logs fixture")
@@ -577,6 +844,18 @@ private final class CodexHomeFixture {
             guard sqlite3_step(statement) == SQLITE_DONE else {
                 throw BehaviorTestFailure(message: "could not insert log fixture")
             }
+        }
+    }
+
+    func writeIncompatibleLog(databaseName: String) throws {
+        let path = url.appendingPathComponent(databaseName).path
+        var database: OpaquePointer?
+        guard sqlite3_open(path, &database) == SQLITE_OK, let database else {
+            throw BehaviorTestFailure(message: "could not create incompatible logs fixture")
+        }
+        defer { sqlite3_close(database) }
+        guard sqlite3_exec(database, "CREATE TABLE logs (id INTEGER PRIMARY KEY)", nil, nil, nil) == SQLITE_OK else {
+            throw BehaviorTestFailure(message: "could not create incompatible logs table")
         }
     }
 

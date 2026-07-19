@@ -2,7 +2,13 @@
 
 ## Mission
 
-在本仓库实现个人自用的 macOS 菜单栏伴侣应用 **Codex Pulse**。开始任何设计、实现或评审前，必须完整阅读 `docs/PRD-codex-pulse.md`。PRD 是产品行为与验收标准的唯一事实来源；不要擅自扩展范围。
+**Codex Pulse** 的使命是在 Codex Desktop 运行期间，以低干扰、可信且完全本地的 macOS 菜单栏状态，帮助个人用户判断 weekly 额度和当前用户可见主会话的运行状态。
+
+Codex Pulse 必须作为独立、只读、无网络的观察者工作：不改变 Codex、不读取凭证、不复制或持久化会话内容、不猜测缺失指标；数据源不兼容或证据不足时按字段降级为未知；Codex 退出后停止全部数据观察。
+
+产品决策优先级：`数据可信与隐私 > 不干扰 Codex > 主会话归属正确 > 实时性 > 视觉丰富度`。
+
+开始任何设计、实现或评审前，必须完整阅读 `docs/PRD-codex-pulse.md`。PRD 是产品行为与验收标准的唯一事实来源；不要擅自扩展范围。
 
 ## Non-negotiable Boundaries
 
@@ -32,13 +38,21 @@
 
 保持以下单向依赖：
 
-`只读数据源 → 会话解析/指标计算 → StatusSnapshot → 菜单栏展示`
+`生命周期/偏好/文件事件 → PulseApplicationModel/Scheduler → PulseRuntime → CodexObservationRepository → SessionResolver/Metrics → PulseState → PulsePresenter → AppKit/SwiftUI`
 
 - UI 不得直接访问 SQLite 或 JSONL。
+- `PulseRuntime.refresh` 是应用数据刷新的唯一外部 Interface；一次调用必须返回同一观察批次的 `PulseState`。
+- `PulseApplicationModel` 是生命周期、刷新节奏与最终 `PulseViewState` 的纯状态机测试 Seam；系统 Adapter 不得复制其产品判断。
+- `CodexObservationRepository` 是只读数据 Module；原始流式文本不得越过 Adapter Seam，只允许输出 token 数和类型化事实。
 - 数据源适配器应按能力和字段检测兼容 Codex 版本，不要把 `state_5.sqlite` 或 `logs_2.sqlite` 当成永久文件名。
 - SQLite 使用只读、WAL 兼容的短查询；避免长事务和全表重复扫描。
 - JSONL 只解析完整行，支持半行写入、轮转和 inode 变化。
-- 以不可变的统一 `StatusSnapshot` 作为主要产品测试缝。
+- `StatusSnapshot` 只表达 Codex 领域状态；展示偏好和格式化只能存在于 `PulsePresenter`。
+- 每项指标独立携带 availability、observedAt、source 与结构化 issue；未知不得冒充为 0。
+- 以不可变的统一 `PulseState` 和 `PulseViewState` 作为主要产品测试 Seam。
+- 数据采集在 actor 中执行；只有 Presenter 结果与 `NSStatusItem` 操作进入 MainActor。
+- 刷新必须 single-flight；空闲时由文件事件驱动，活动响应期间才启用 500 ms 时钟。
+- 状态项数据健康与系统可达性分离；恢复策略必须有次数上限，不得循环销毁状态项。
 - 启动监视器应事件驱动，并与菜单栏 UI/数据观察生命周期分离。
 
 ## Technology Direction
